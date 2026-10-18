@@ -1,0 +1,189 @@
+---
+title: "RP2 — Script 4: Memory Performance & Brain Scores"
+author: "Julia Kearley"
+date: "`r format(Sys.Date(), '%B %d, %Y')`"
+output:
+  html_document:
+    toc: true
+    toc_depth: 3
+    toc_float: true
+    theme: united
+    code_folding: show
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, message = FALSE, warning = FALSE,
+                      fig.width = 10, fig.height = 7, dpi = 300)
+source(here::here("scripts", "00_functions.R"))
+setup_run()
+```
+
+# Overview
+
+Methods 2.9.4 / Results 3.4.
+
+1. Memory sub-sample: exclude CS = 0 or CR < 1/6 (mean across difficulty).
+2. **Table 3** — CS and CR by group: Welch t if Shapiro-Wilk p > .05 in both
+   groups, otherwise Mann-Whitney U; BH-FDR across the two outcomes.
+3. **Table S3 / Figure S3** — within each group, CS and CR regressed on the
+   within-group z-scored brain score of each LV in `params$memory_lvs` (LV2);
+   BH-FDR across all regressions.
+
+```{r load-packages}
+pacman::p_load(here, tidyverse, broom, effsize, flextable, officer, knitr)
+```
+
+# 1. Memory sub-sample
+
+```{r load-data}
+pls_results <- readRDS(cleaning_path(params$run_label, "pls_results.rds"))
+groups      <- levels(pls_results$pls_df$group_var)
+
+analysis_df <- pls_results$pls_df %>%
+  mutate(cs_rate_mean = rowMeans(across(all_of(params$cs_vars)), na.rm = TRUE),
+         cr_rate_mean = rowMeans(across(all_of(params$cr_vars)), na.rm = TRUE))
+
+cr_chance <- 1/6
+excluded <- analysis_df %>%
+  filter(cs_rate_mean == 0 | cr_rate_mean < cr_chance) %>%
+  mutate(reason = case_when(cs_rate_mean == 0 & cr_rate_mean < cr_chance ~ "CS=0 & CR<1/6",
+                            cs_rate_mean == 0 ~ "CS=0", TRUE ~ "CR<1/6")) %>%
+  select(id, group_var, cs_rate_mean, cr_rate_mean, reason)
+print(excluded)
+write_csv(excluded, shared_output_path("qc", "memory_exclusions.csv"))
+
+memory_df <- analysis_df %>% filter(!id %in% excluded$id)
+cat(sprintf("Memory sub-sample: N = %d\n", nrow(memory_df)))
+print(table(memory_df$group_var))
+```
+
+# 2. Table 3 — memory performance by group
+
+```{r table4}
+outcomes <- c(cs_rate_mean = "Correct Source (CS)", cr_rate_mean = "Correct Rejection (CR)")
+
+mem_tests <- map_dfr(names(outcomes), function(v) {
+  res <- run_cont_test(v, memory_df, alpha = params$alpha)
+  desc <- memory_df %>% group_by(group_var) %>%
+    summarise(cell = sprintf("%.3f (%.3f)", mean(.data[[v]], na.rm = TRUE),
+                             sd(.data[[v]], na.rm = TRUE)), .groups = "drop")
+  res %>% mutate(
+    Outcome   = outcomes[[v]],
+    Pre       = desc$cell[desc$group_var == groups[1]],
+    Post      = desc$cell[desc$group_var == groups[2]],
+    Statistic = if (test == "t-test") sprintf("t(%.1f) = %.2f", df, statistic)
+                else sprintf("U = %.0f", statistic),
+    ES        = if (test == "t-test") sprintf("d = %.2f", effect_size)
+                else sprintf("r = %.2f", effect_size))
+}) %>%
+  mutate(p_fdr = p.adjust(p_value, method = params$correction_method))
+
+table4 <- mem_tests %>% transmute(Outcome, Pre, Post, Statistic, p_FDR = format_pval(p_fdr), ES)
+n_pre  <- sum(memory_df$group_var == groups[1])
+n_post <- sum(memory_df$group_var == groups[2])
+
+ft4 <- flextable(table4) %>%
+  set_header_labels(Pre = "Premenopausal\nM (SD)", Post = "Postmenopausal\nM (SD)",
+                    p_FDR = "p_FDR", ES = "Effect size") %>%
+  add_header_row(values = c("", "Reproductive-stage group", "Unadjusted group comparison"),
+                 colwidths = c(1, 2, 3)) %>%
+  align(align = "center", part = "header") %>%
+  align(j = "Outcome", align = "left", part = "all") %>%
+  align(j = 2:6, align = "center", part = "body") %>%
+  bold(part = "header") %>%
+  fontsize(size = 11, part = "all") %>% font(fontname = "Times New Roman", part = "all") %>%
+  hline_top(border = fp_border(width = 2), part = "header") %>%
+  hline_bottom(border = fp_border(width = 2), part = "body") %>%
+  autofit() %>%
+  set_caption("Table 3. Memory Task Performance by Reproductive-Stage Group") %>%
+  add_footer_lines(paste0(
+    sprintf("Note. N = %d (premenopausal = %d, postmenopausal = %d) after exclusion of ",
+            nrow(memory_df), n_pre, n_post),
+    "participants failing memory-completeness criteria (CS = 0 or CR < 1/6). Values are mean ",
+    "accuracy rate (SD). Unadjusted test: Mann-Whitney U if any reproductive-stage group is ",
+    "non-Gaussian (Shapiro-Wilk p < .05), Welch t otherwise. Effect size: rank-biserial r for U, ",
+    "Cohen's d for t (signed premenopausal minus postmenopausal). p_FDR: Benjamini-Hochberg ",
+    "correction across two outcomes (CS, CR).")) %>%
+  italic(part = "footer") %>% fontsize(size = 10, part = "footer")
+
+ft4
+save_as_docx(ft4, path = ms_path("Table3_memory_performance.docx"))
+write_csv(mem_tests, ms_path("Table3_memory_performance.csv"))
+```
+
+# 3. Table S3 — brain score × memory regressions
+
+```{r regressions}
+regressions <- expand_grid(LV = params$memory_lvs, outcome = names(outcomes), Group = groups) %>%
+  pmap_dfr(function(LV, outcome, Group) {
+    df  <- memory_df %>% filter(group_var == Group) %>%
+      mutate(brain_score_z = as.numeric(scale(.data[[paste0("usc_", LV)]])))
+    fit <- lm(as.formula(paste(outcome, "~ brain_score_z")), data = df)
+    co  <- tidy(fit, conf.int = TRUE) %>% filter(term == "brain_score_z")
+    tibble(LV, Outcome = outcomes[[outcome]], Group, n = nrow(df),
+           b = co$estimate, SE = co$std.error, t = co$statistic,
+           df = fit$df.residual, p = co$p.value,
+           ci_low = co$conf.low, ci_high = co$conf.high, R2 = glance(fit)$r.squared)
+  }) %>%
+  mutate(p_fdr = p.adjust(p, method = params$correction_method))
+
+kable(regressions, digits = 3)
+write_csv(regressions, supp_path("TableS3_LV2_brainscore_memory.csv"))
+
+ftS3 <- regressions %>%
+  transmute(LV, Outcome, Group,
+            b = sprintf("%.3f", b), SE = sprintf("%.3f", SE), t = sprintf("%.2f", t), df,
+            p = format_pval(p), p_FDR = format_pval(p_fdr),
+            `95% CI` = sprintf("[%.3f, %.3f]", ci_low, ci_high), `R²` = sprintf("%.3f", R2)) %>%
+  flextable() %>%
+  merge_v(j = c("LV", "Outcome")) %>%
+  align(j = 4:11, align = "center", part = "all") %>%
+  bold(part = "header") %>%
+  fontsize(size = 11, part = "all") %>% font(fontname = "Times New Roman", part = "all") %>%
+  hline_top(border = fp_border(width = 2), part = "header") %>%
+  hline_bottom(border = fp_border(width = 2), part = "body") %>%
+  autofit() %>%
+  set_caption("Table S3. Within-Group Regression: LV2 Brain Score Predicting Mean Memory Accuracy") %>%
+  add_footer_lines(c(
+    sprintf(paste0("Note. N = %d after memory-performance exclusion (premenopausal = %d, ",
+                   "postmenopausal = %d). Brain score z-scored within each group; outcome = ",
+                   "mean accuracy across easy and hard conditions."), nrow(memory_df), n_pre, n_post),
+    sprintf("p_FDR: Benjamini-Hochberg correction across %d regressions.", nrow(regressions)),
+    "b = unstandardized coefficient (change in accuracy per 1 SD of brain score); CI = 95% confidence interval.")) %>%
+  italic(part = "footer") %>% fontsize(size = 10, part = "footer")
+
+ftS3
+save_as_docx(ftS3, path = supp_path("TableS3_LV2_brainscore_memory.docx"))
+```
+
+# 4. Figure S3 — brain score × memory scatter
+
+```{r figS3, fig.width = 10, fig.height = 6}
+scatter_df <- memory_df %>%
+  group_by(group_var) %>%
+  mutate(across(all_of(paste0("usc_", params$memory_lvs)), ~ as.numeric(scale(.x)))) %>%
+  ungroup() %>%
+  pivot_longer(all_of(paste0("usc_", params$memory_lvs)), names_to = "LV", values_to = "brain_score_z") %>%
+  pivot_longer(names(outcomes), names_to = "measure", values_to = "accuracy") %>%
+  mutate(LV = sub("usc_", "", LV),
+         measure = factor(outcomes[measure], levels = outcomes))
+
+p_figS3 <- ggplot(scatter_df, aes(x = brain_score_z, y = accuracy,
+                                  color = group_var, fill = group_var)) +
+  geom_point(alpha = 0.65, size = 2.2) +
+  geom_smooth(method = "lm", se = TRUE, alpha = 0.18, linewidth = 0.9) +
+  scale_color_manual(values = GROUP_COLORS, name = "Group") +
+  scale_fill_manual(values = GROUP_COLORS, name = "Group") +
+  facet_grid(measure ~ LV, scales = "free_y", switch = "y") +
+  labs(x = "Brain score (z-scored within group)", y = "Mean accuracy") +
+  theme_apa(base_size = 12) +
+  theme(legend.position = "bottom", strip.background = element_blank(),
+        strip.placement = "outside", strip.text = element_text(face = "bold", size = 11))
+
+print(p_figS3)
+save_png(p_figS3, supp_path("FigureS3_LV2_brainscore_memory.png"), width = 10, height = 6)
+```
+
+```{r session-info}
+save_session_info("script04")
+```

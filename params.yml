@@ -1,0 +1,158 @@
+# =============================================================================
+# params.yml — shared analysis parameters for the RP2 pipeline (N = 82)
+# Read by setup_run() in scripts/00_functions.R; available as `params`.
+# =============================================================================
+
+# ── Inputs ───────────────────────────────────────────────────────────────────
+raw_master_file: "BHAMM-MTL_Master_V2024-11.sav"    # in data/raw/
+rsfmri_qc_file:  "BHAMM_rsfMRI_QC_Nov14_2024.xlsx"  # in data/raw/
+# Per-participant motion summary (mean FD, mean DVARS, censored and retained
+# volumes) for the final sample; IDs only, joined to group in 02 (Table S2).
+rsfmri_motion_file: "BHAMM-MTL_rsfMRI_MotionStats_2026-10.csv"  # in data/raw/
+
+# ── Participant-level exclusions ─────────────────────────────────────────────
+# Kept in a private file (data/ is not in the repository). It holds
+#   sample_excl:        IDs dropped AFTER missForest imputation (imputation runs
+#                       on the full sample; everyone else keeps their imputed
+#                       values), each with the reason shown in Figure 1
+#   rsfmri_manual_excl: manual rsfMRI removals, each with a reason
+# Format: a YAML list of {id, reason} under each name.
+participant_exclusions_file: "data/participant_exclusions.yml"
+
+# ── B-PLS runs ───────────────────────────────────────────────────────────────
+# One primary (omnibus) run + one reduced-block run per behavioural variable.
+# Each run has its own bpls_result.mat under data/matlab_io/output/<segment>/.
+# run.R knits 03_pls_results.Rmd once per run by setting RP2_ACTIVE_RUN.
+pls_runs:
+  omnibus_4bv:
+    segment: "main_4bv_pls_sept20"
+    pls_vars: ["chol_raw_imputed", "bp_systolic_imputed", "s2_age", "edu"]
+    role: "primary"
+    label: "Omnibus 4-BV (TC + SBP + Age + Edu)"
+  tc:
+    segment: "sub_pls_tc_sept20"
+    pls_vars: ["chol_raw_imputed"]
+    role: "sensitivity"
+    label: "TC reduced-block B-PLS"
+    figure: "S2C"         # supplementary figure number and file-name tag
+    short: "TC"
+  sbp:
+    segment: "sub_pls_sbp_sept20"
+    pls_vars: ["bp_systolic_imputed"]
+    role: "sensitivity"
+    label: "SBP reduced-block B-PLS"
+    figure: "S2A"
+    short: "SBP"
+  age:
+    segment: "sub_pls_age_sept20"
+    pls_vars: ["s2_age"]
+    role: "sensitivity"
+    label: "Age reduced-block B-PLS"
+    figure: "S2B"
+    short: "Age"
+  edu:
+    segment: "sub_pls_edu_sept20"
+    pls_vars: ["edu"]
+    role: "sensitivity"
+    label: "Education reduced-block B-PLS"
+    figure: "S2D"
+    short: "Edu"
+
+pls_var_labels:
+  chol_raw_imputed: "Cholesterol"
+  bp_systolic_imputed: "Systolic BP"
+  s2_age: "Age"
+  edu: "Education"
+
+# LVs reported in the manuscript and their Figure / Table numbers. LV2 is
+# significant (p < .001): main-text Figure 2 + Table 2. LV1 is reported
+# descriptively (p = .327) in Supplementary Section S1: Figure S4 + Table S4.
+report_lvs:
+  LV1: {figure: "S4", table: "S4"}
+  LV2: {figure: "2",  table: "2"}
+
+# LVs carried into the brain-score × memory regressions (Table S3, Fig S3).
+memory_lvs: ["LV2"]
+
+# PLS is sign-indeterminate. -1 flips every output for that LV (USC, VSC,
+# correlations, CIs, BSRs) so positive-weight edges carry the reliable pattern.
+lv_sign_flip:
+  LV1: -1
+  LV2: -1
+
+# Bootstrap CIs on the brain-score × behaviour correlations (Table 2, Table S4,
+# Figures 2A / S4A): PLSGUI's stored boot_result.llcorr / ulcorr (clim = 95).
+# pls_analysis.m sets ll = 100 - clim, ul = clim and rri_distrib.m takes
+# percentile(distrib, ll) and percentile(distrib, ul) of the 500 bootstrap
+# samples. ci_label is the wording used in figure titles, table headers and notes.
+ci_label: "bootstrap CI"
+# The pre − post difference CIs are the 2.5th / 97.5th percentiles of the
+# bootstrap differences (computed in 03, not by PLSGUI).
+
+# ── Physical activity coding (IPAQ-SF; Kivipelto et al., 2006) ───────────────
+# Active = vigorous activity on >= min_days days/week for >= min_minutes.
+exercise:
+  min_days: 2
+  min_minutes: 20
+
+# ── Memory task ──────────────────────────────────────────────────────────────
+cs_vars: ["cs_rate_easy", "cs_rate_hard"]
+cr_vars: ["cr_rate_easy", "cr_rate_hard"]
+
+# ── Extra raw columns carried through 01_cleaning (Table 1 rows) ────────────
+extra_cleaning_cols:
+  - "bdi_somatic"
+  - "bdi_cognitive"
+  - "bai_somatic"
+  - "bai_subjective"
+  - "stress"
+  - "psqi_global_score"
+
+# ── Table 1 ──────────────────────────────────────────────────────────────────
+# Variables of interest: FDR-corrected across these 6 tests only.
+t1_interest_cont: ["s2_age", "edu", "bp_systolic_imputed", "chol_raw_imputed", "bmi"]
+t1_interest_cat:  ["Exercise_coded"]
+# Other characteristics: uncorrected p.
+t1_clinical_cont: ["e2_raw", "fsh_raw",
+                   "bdi", "bdi_somatic", "bdi_cognitive",
+                   "bai", "bai_somatic", "bai_subjective",
+                   "psqi_global_score", "stress",
+                   "bp_diastolic"]
+t1_clinical_cat:  ["repro_cond_pcos", "current_hbc_med_use", "any_psychotropic",
+                   "any_chol_med", "any_antihypertensive", "apoe4_carrier"]
+t1_subscales:     ["bdi_somatic", "bdi_cognitive", "bai_somatic", "bai_subjective"]
+
+labels:
+  cont:
+    s2_age:               "Age (years)"
+    edu:                  "Education (years)"
+    bp_systolic_imputed:  "Systolic BP (mmHg)"
+    chol_raw_imputed:     "Total Cholesterol (mmol/L)"
+    bmi:                  "BMI (kg/m²)"
+    e2_raw:               "Estradiol (pmol/L)"
+    fsh_raw:              "FSH (IU/L)"
+    bdi:                  "BDI-II Total"
+    bdi_somatic:          "Somatic"
+    bdi_cognitive:        "Cognitive"
+    bai:                  "BAI Total"
+    bai_somatic:          "Somatic"
+    bai_subjective:       "Subjective"
+    psqi_global_score:    "PSQI Global Score"
+    stress:               "Perceived Stress"
+    bp_diastolic:         "Diastolic BP (mmHg)"
+  cat:
+    Exercise_coded:        "Physical Activity (Active)"
+    repro_cond_pcos:       "PCOS"
+    current_hbc_med_use:   "HBC Use"
+    any_psychotropic:      "Psychotropic Medication Use"
+    any_chol_med:          "Cholesterol-Lowering Medication Use"
+    any_antihypertensive:  "Antihypertensive Medication Use"
+    apoe4_carrier:         "APOEε4 Carrier"
+
+# ── Statistics ───────────────────────────────────────────────────────────────
+alpha: 0.05
+correction_method: "fdr"
+
+# ── Reproducibility ──────────────────────────────────────────────────────────
+seed: 20251001
+seed_imputation: 123

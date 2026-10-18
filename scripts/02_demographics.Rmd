@@ -1,0 +1,315 @@
+---
+title: "RP2 — Script 2: Demographics (Table 1), PCOS MANOVAs, Motion (Table S2), Age distribution"
+author: "Julia Kearley"
+date: "`r format(Sys.Date(), '%B %d, %Y')`"
+output:
+  html_document:
+    toc: true
+    toc_depth: 3
+    toc_float: true
+    theme: united
+    code_folding: show
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, message = FALSE, warning = FALSE)
+source(here::here("scripts", "00_functions.R"))
+setup_run()
+```
+
+# Overview
+
+Group comparisons on the six demographic/cardiometabolic variables (Methods
+2.9.2; FDR across these six only) and the other Table 1 characteristics
+(uncorrected), the PCOS MANOVAs reported in Results 3.1, head motion by group
+(Table S2) and the age distribution by group (working figure, not in the paper).
+
+- Continuous: Welch t-test if Shapiro-Wilk p > .05 in both groups, otherwise
+  Mann-Whitney U. Effect sizes: Cohen's d or rank-biserial r, signed
+  premenopausal minus postmenopausal.
+- Categorical: Pearson chi-square (no continuity correction), or Fisher's
+  exact test if any expected count < 5. Effect size: Cramér's V.
+
+**Outputs:** `outputs/manuscript/Table1_demographics.{docx,csv}`,
+`outputs/manuscript/Results3.1_PCOS_MANOVA.csv`,
+`outputs/supplement/TableS2_motion.{docx,csv}`; working output
+`outputs/qc/age_distribution/` (age figure and overlap stats; not in the paper)
+
+```{r load-packages}
+pacman::p_load(here, tidyverse, effsize, flextable, officer, knitr)
+```
+
+```{r load-data}
+bhamm_clean <- readRDS(cleaning_path("bhamm_clean.rds")) %>%
+  # Hormone non-detects coded -1 -> NA (E2 is below detection for most
+  # postmenopausal participants, so its Post-Meno mean uses few values).
+  mutate(across(c(e2_raw, fsh_raw, lh_raw, prog_raw, testo_raw), ~ if_else(. == -1, NA_real_, .)))
+
+stopifnot(levels(bhamm_clean$group_var) == c("Pre-Meno", "Post-Meno"))
+cat("N =", nrow(bhamm_clean), "\n"); print(table(bhamm_clean$group_var))
+cat("Non-missing E2 by group:\n"); print(tapply(!is.na(bhamm_clean$e2_raw), bhamm_clean$group_var, sum))
+```
+
+# 1. Between-group tests
+
+```{r tests}
+cont_vars <- c(params$t1_interest_cont, params$t1_clinical_cont)
+cat_vars  <- c(params$t1_interest_cat,  params$t1_clinical_cat)
+
+tests <- bind_rows(
+  map_dfr(cont_vars, run_cont_test, data = bhamm_clean, alpha = params$alpha),
+  map_dfr(cat_vars,  run_cat_test,  data = bhamm_clean)
+) %>%
+  mutate(interest = variable %in% c(params$t1_interest_cont, params$t1_interest_cat)) %>%
+  # Table 1 row order: variables of interest first
+  arrange(match(variable, c(params$t1_interest_cont, params$t1_interest_cat,
+                            params$t1_clinical_cont, params$t1_clinical_cat)))
+
+# FDR across the six variables of interest only
+tests$p_fdr <- NA_real_
+tests$p_fdr[tests$interest] <- p.adjust(tests$p_value[tests$interest],
+                                        method = params$correction_method)
+
+tests %>% mutate(across(where(is.numeric), ~ round(.x, 3))) %>% kable()
+```
+
+# 2. Table 1
+
+```{r table1}
+labels <- c(unlist(params$labels$cont), unlist(params$labels$cat))
+# Level shown for each categorical variable (Exercise_coded: -1 = Active)
+cat_level <- c(Exercise_coded = "-1", repro_cond_pcos = "Yes", current_hbc_med_use = "Yes",
+               any_psychotropic = "Yes", any_chol_med = "Yes",
+               any_antihypertensive = "Yes", apoe4_carrier = "Carrier")
+
+describe_group <- function(var, g) {
+  x <- bhamm_clean[[var]][bhamm_clean$group_var == g]
+  if (var %in% cont_vars) {
+    sprintf("%.2f (%.2f)", mean(x, na.rm = TRUE), sd(x, na.rm = TRUE))
+  } else {
+    n <- sum(as.character(x) == cat_level[[var]], na.rm = TRUE)
+    sprintf("%d (%.1f%%)", n, 100 * n / sum(!is.na(x)))
+  }
+}
+
+table1 <- tests %>%
+  rowwise() %>%
+  mutate(
+    Cluster        = if (interest) "Variables of Interest" else "Clinical Validation",
+    Characteristic = paste0(if (variable %in% params$t1_subscales) "  " else "",
+                            labels[[variable]]),
+    `Pre-Meno`     = describe_group(variable, "Pre-Meno"),
+    `Post-Meno`    = describe_group(variable, "Post-Meno"),
+    Statistic      = switch(test,
+                            "t-test"         = sprintf("t(%.1f) = %.2f", df, statistic),
+                            "Mann-Whitney U" = sprintf("U = %.0f", statistic),
+                            "Chi-square"     = sprintf("χ²(%d) = %.2f", as.integer(df), statistic),
+                            "Fisher's Exact" = "Fisher's Exact"),
+    p              = format_pval(p_value),
+    p_fdr          = if (interest) format_pval(p_fdr) else "—",
+    ES             = sprintf("%.2f", effect_size)
+  ) %>%
+  ungroup() %>%
+  select(Cluster, Characteristic, `Pre-Meno`, `Post-Meno`, Statistic, p, p_fdr, ES)
+
+n_pre  <- sum(bhamm_clean$group_var == "Pre-Meno")
+n_post <- sum(bhamm_clean$group_var == "Post-Meno")
+
+ft_table1 <- flextable(table1) %>%
+  set_header_labels(Cluster = "", ES = "ES") %>%
+  compose(j = "p_fdr", part = "header", value = as_paragraph("p", as_sub("FDR"))) %>%
+  compose(j = "Pre-Meno",  part = "header", value = as_paragraph(sprintf("Pre-Meno (n = %d)", n_pre))) %>%
+  compose(j = "Post-Meno", part = "header", value = as_paragraph(sprintf("Post-Meno (n = %d)", n_post))) %>%
+  merge_v(j = "Cluster") %>%
+  align(j = c("Cluster", "Characteristic"), align = "left", part = "all") %>%
+  align(j = c("Pre-Meno", "Post-Meno", "Statistic", "p", "p_fdr", "ES"), align = "center", part = "all") %>%
+  bold(part = "header") %>% bold(j = "Cluster", part = "body") %>%
+  hline(i = sum(table1$Cluster == "Variables of Interest"),
+        border = fp_border(width = 1, color = "grey60")) %>%
+  fontsize(size = 11, part = "all") %>% font(fontname = "Times New Roman", part = "all") %>%
+  hline_top(border = fp_border(width = 2), part = "header") %>%
+  hline_bottom(border = fp_border(width = 1), part = "header") %>%
+  hline_bottom(border = fp_border(width = 2), part = "body") %>%
+  autofit() %>%
+  set_caption("Table 1. Demographics and Clinical Characteristics by Menopausal Group") %>%
+  add_footer_lines(c(
+    "Note. Values are M (SD) for continuous variables and n (%) for categorical variables.",
+    "Indented rows under BDI-II Total / BAI Total are subscale scores (somatic, cognitive/subjective).",
+    paste0("Variables of interest: p values FDR-corrected across 6 tests (Benjamini & Hochberg, 1995). ",
+           "All other variables: uncorrected p values (— indicates FDR not applied)."),
+    paste0("Continuous variables: Welch t-test if Shapiro-Wilk p > .05 in both groups, otherwise ",
+           "Mann-Whitney U. Categorical variables: Pearson χ², or Fisher's exact test if any ",
+           "expected count < 5."),
+    paste0("ES = effect size: Cohen's d (t-test) or rank-biserial r (Mann-Whitney U), both signed ",
+           "premenopausal minus postmenopausal; Cramér's V (χ²/Fisher's).")
+  )) %>%
+  italic(part = "footer") %>% fontsize(size = 9, part = "footer")
+
+ft_table1
+save_as_docx(ft_table1, path = ms_path("Table1_demographics.docx"))
+write_csv(table1, ms_path("Table1_demographics.csv"))
+```
+
+# 3. PCOS MANOVAs (Results 3.1)
+
+PCOS vs no PCOS on (a) hormones and (b) the six demographic/cardiometabolic
+variables. Pillai's trace; listwise deletion.
+
+```{r pcos-manova}
+pcos_sets <- list(
+  hormones = c("e2_raw", "prog_raw", "testo_raw", "lh_raw", "fsh_raw"),
+  demographic_cardiometabolic = c("s2_age", "edu", "bmi", "chol_raw_imputed",
+                                  "bp_systolic_imputed", "Exercise_coded")
+)
+
+pcos_manova <- imap_dfr(pcos_sets, function(dvs, set_name) {
+  df  <- bhamm_clean %>% select(repro_cond_pcos, group_var, all_of(dvs)) %>% drop_na()
+  fit <- manova(as.matrix(df[dvs]) ~ repro_cond_pcos, data = df)
+  s   <- summary(fit, test = "Pillai")$stats
+  tibble(set = set_name, dvs = paste(dvs, collapse = ", "),
+         n = nrow(df), n_pcos = sum(df$repro_cond_pcos == "Yes"),
+         n_post_meno = sum(df$group_var == "Post-Meno"),
+         pillai = s[1, "Pillai"], F = s[1, "approx F"],
+         df1 = s[1, "num Df"], df2 = s[1, "den Df"], p = s[1, "Pr(>F)"])
+})
+
+pcos_manova %>% mutate(across(where(is.numeric), ~ round(.x, 3))) %>% kable()
+write_csv(pcos_manova, ms_path("Results3.1_PCOS_MANOVA.csv"))
+```
+
+# 4. Table S2 — head motion by group (Results 3.1)
+
+Per-participant motion summary from the rsfMRI postprocessing
+(`params$rsfmri_motion_file`, IDs only). Same test rule as Table 1; p values
+are uncorrected.
+
+```{r motion}
+motion_raw <- read_csv(here::here("data", "raw", params$rsfmri_motion_file), show_col_types = FALSE)
+stopifnot("motion file must have one row per participant in the final sample" =
+            !anyDuplicated(motion_raw$ID) && setequal(motion_raw$ID, bhamm_clean$id))
+
+motion <- bhamm_clean %>% select(id, group_var) %>%
+  left_join(motion_raw %>% rename(id = ID, mean_fd = Mean_FD, mean_dvars = Mean_Dvars,
+                                  censored = N_Scrubbed, retained = Length_After_Scrub),
+            by = "id")
+n_vols <- unique(motion$censored + motion$retained)
+cat("Censored + retained volumes:", n_vols, "\n")
+
+motion_vars <- c(mean_fd = "Mean framewise displacement (mm)", mean_dvars = "Mean DVARS",
+                 censored = "Censored volumes", retained = "Retained volumes")
+motion_digits <- c(mean_fd = 3, mean_dvars = 2, censored = 1, retained = 1)
+
+motion_tests <- map_dfr(names(motion_vars), run_cont_test, data = motion, alpha = params$alpha)
+tabS3 <- motion_tests %>% rowwise() %>%
+  mutate(
+    Measure = motion_vars[[variable]],
+    `Pre-Meno` = with(motion, sprintf("%.*f (%.*f)", motion_digits[[variable]],
+                                      mean(get(variable)[group_var == "Pre-Meno"]),
+                                      motion_digits[[variable]], sd(get(variable)[group_var == "Pre-Meno"]))),
+    `Post-Meno` = with(motion, sprintf("%.*f (%.*f)", motion_digits[[variable]],
+                                       mean(get(variable)[group_var == "Post-Meno"]),
+                                       motion_digits[[variable]], sd(get(variable)[group_var == "Post-Meno"]))),
+    Statistic = if (test == "t-test") sprintf("t(%.1f) = %.2f", df, statistic) else sprintf("U = %.1f", statistic),
+    p = format_pval(p_value),
+    ES = sprintf("%s = %.2f", if (test == "t-test") "d" else "r", effect_size)) %>%
+  ungroup()
+kable(tabS3 %>% select(Measure, `Pre-Meno`, `Post-Meno`, Statistic, p, ES))
+
+ft_S3 <- tabS3 %>% select(Measure, `Pre-Meno`, `Post-Meno`, Statistic, p, ES) %>%
+  flextable() %>%
+  compose(j = "Pre-Meno",  part = "header", value = as_paragraph(sprintf("Pre-Meno (n = %d)", n_pre))) %>%
+  compose(j = "Post-Meno", part = "header", value = as_paragraph(sprintf("Post-Meno (n = %d)", n_post))) %>%
+  align(j = 2:6, align = "center", part = "all") %>%
+  bold(part = "header") %>%
+  fontsize(size = 11, part = "all") %>% font(fontname = "Times New Roman", part = "all") %>%
+  hline_top(border = fp_border(width = 2), part = "header") %>%
+  hline_bottom(border = fp_border(width = 1), part = "header") %>%
+  hline_bottom(border = fp_border(width = 2), part = "body") %>%
+  autofit() %>%
+  set_caption("Table S2. Head Motion by Reproductive-Stage Group") %>%
+  add_footer_lines(c(
+    "Note. Values are M (SD). DVARS = root-mean-square change in BOLD signal between consecutive volumes.",
+    paste0("Censored volumes: volumes removed by motion censoring (FD > 0.5 mm or DVARS > 2 SD above the ",
+           "mean, plus the preceding and following volume). Retained volumes: volumes remaining after ",
+           sprintf("censoring. Censored + retained = %s for every participant, so these two tests are equivalent.",
+                   paste(n_vols, collapse = "/"))),
+    paste0("Welch t-test if Shapiro-Wilk p > .05 in both groups, otherwise Mann-Whitney U; uncorrected p. ",
+           "ES = Cohen's d (t-test) or rank-biserial r (Mann-Whitney U), signed premenopausal minus ",
+           "postmenopausal."))) %>%
+  italic(part = "footer") %>% fontsize(size = 9, part = "footer")
+
+ft_S3
+save_as_docx(ft_S3, path = supp_path("TableS2_motion.docx"))
+write_csv(tabS3, supp_path("TableS2_motion.csv"))
+```
+
+# 5. Age distribution by group (working output)
+
+Age at scan in 1-year bins; the shaded band is the age overlap (youngest
+postmenopausal to oldest premenopausal participant). The stats file gives the
+overlap counts and the within-group Spearman correlation between age and
+education (two-sided permutation p, 10,000 permutations).
+
+```{r age-distribution, fig.width = 7.5, fig.height = 4}
+overlap <- c(min(bhamm_clean$s2_age[bhamm_clean$group_var == "Post-Meno"]),
+             max(bhamm_clean$s2_age[bhamm_clean$group_var == "Pre-Meno"]))
+
+spearman_perm <- function(x, y, n = 10000) {
+  rx <- rank(x); ry <- rank(y)
+  r  <- cor(rx, ry)
+  null <- replicate(n, cor(rx, sample(ry)))
+  c(rho = r, p_perm = (sum(abs(null) >= abs(r)) + 1) / (n + 1))
+}
+set.seed(params$seed)
+age_stats <- bind_rows(
+  map_dfr(c("Pre-Meno", "Post-Meno"), function(g) {
+    d  <- bhamm_clean %>% filter(group_var == g)
+    io <- d %>% filter(s2_age >= overlap[1], s2_age <= overlap[2])
+    sp <- spearman_perm(d$s2_age, d$edu)
+    tibble(group = c("Pre-Meno" = "Premenopausal", "Post-Meno" = "Postmenopausal")[[g]],
+           n = nrow(d), age_mean = mean(d$s2_age), age_sd = sd(d$s2_age),
+           age_min = min(d$s2_age), age_max = max(d$s2_age),
+           n_in_overlap = nrow(io), edu_mean_in_overlap = mean(io$edu),
+           rho_age_edu = sp[["rho"]], p_perm = sp[["p_perm"]])
+  }),
+  {
+    sp <- spearman_perm(bhamm_clean$s2_age, bhamm_clean$edu)
+    tibble(group = "Full sample", n = nrow(bhamm_clean), age_mean = mean(bhamm_clean$s2_age),
+           age_sd = sd(bhamm_clean$s2_age), age_min = min(bhamm_clean$s2_age),
+           age_max = max(bhamm_clean$s2_age), rho_age_edu = sp[["rho"]], p_perm = sp[["p_perm"]])
+  }) %>% mutate(across(where(is.double), ~ round(.x, 3)))
+kable(age_stats)
+age_dir <- function(f) shared_output_path("qc", "age_distribution", f)
+write_csv(age_stats, age_dir("age_overlap_stats.csv"))
+
+breaks <- seq(floor(min(bhamm_clean$s2_age)), ceiling(max(bhamm_clean$s2_age)), by = 1)
+age_counts <- bhamm_clean %>%
+  mutate(bin = cut(s2_age, breaks, right = FALSE, include.lowest = TRUE, labels = FALSE)) %>%
+  count(group_var, bin) %>%
+  complete(group_var, bin = seq_len(length(breaks) - 1), fill = list(n = 0)) %>%
+  mutate(centre = breaks[bin] + 0.5)
+group_labels <- c("Pre-Meno"  = sprintf("Premenopausal (n = %d)", n_pre),
+                  "Post-Meno" = sprintf("Postmenopausal (n = %d)", n_post))
+
+p_age <- ggplot(age_counts, aes(x = centre, y = n, fill = group_var)) +
+  annotate("rect", xmin = overlap[1], xmax = overlap[2], ymin = -Inf, ymax = Inf,
+           fill = "grey85", alpha = 0.6) +
+  geom_col(position = position_dodge(width = 0.84), width = 0.84) +
+  annotate("text", x = mean(overlap), y = Inf, vjust = 1.4, size = 3.2,
+           label = sprintf("Age overlap
+%.1f–%.1f y", overlap[1], overlap[2])) +
+  scale_fill_manual(values = GROUP_COLORS, labels = group_labels, name = NULL) +
+  scale_y_continuous(breaks = function(l) seq(0, ceiling(l[2]), by = 1), expand = expansion(mult = c(0, 0.15))) +
+  labs(x = "Age at scan (years)", y = "Number of participants") +
+  theme_apa(base_size = 11) +
+  theme(legend.position = "inside", legend.position.inside = c(0.85, 0.85),
+        legend.background = element_blank())
+
+print(p_age)
+save_png(p_age, age_dir("age_distribution.png"), width = 7.5, height = 4)
+ggsave(age_dir("age_distribution.pdf"), p_age, width = 7.5, height = 4)
+```
+
+```{r session-info}
+save_session_info("script02")
+```

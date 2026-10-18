@@ -1,0 +1,347 @@
+---
+title: "RP2 — Script 1: Data Cleaning & PLS Export"
+author: "Julia Kearley"
+date: "`r format(Sys.Date(), '%B %d, %Y')`"
+output:
+  html_document:
+    toc: true
+    toc_depth: 3
+    toc_float: true
+    theme: united
+    code_folding: show
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, message = FALSE, warning = FALSE)
+source(here::here("scripts", "00_functions.R"))
+setup_run()
+```
+
+# Overview
+
+Import raw BHAMM data, apply inclusion/exclusion criteria, collate blood
+measures across sessions, impute missing SBP and total cholesterol with
+missForest, drop the sample-level exclusions (`params$sample_excl`) and export
+the MATLAB B-PLS inputs.
+
+**Outputs**
+
+- `data/processed/bhamm_clean.{rds,csv}` — analytic sample (N = 82)
+- `data/matlab_io/input/<segment>/pls_export.csv` + `matlab_group_ids.txt` (every registered run)
+- `outputs/qc/script1_start_ids.csv`, `script1_final_ids.csv`, `exclusion_log.csv`, `rsfmri_qc_exclusions.csv`, `sample_exclusions.csv` — Figure 1 inputs
+- `outputs/supplement/FigureS1_imputation.png` — Figure S1
+
+```{r load-packages}
+pacman::p_load(here, haven, readxl, janitor, tidyverse, naniar, missForest, fedmatch)
+```
+
+# 1. Import & initial filtering
+
+```{r import-raw}
+bhamm_df <- haven::read_sav(here::here("data", "raw", params$raw_master_file)) %>%
+  janitor::clean_names() %>%
+  # Pre- or post-menopausal at BOTH sessions; females only
+  mutate(group_var = factor(case_when(
+    sex == 1 & s1_meno_group == 1 & s2_meno_group == 1 ~ "Pre-Meno",
+    sex == 1 & s1_meno_group == 3 & s2_meno_group == 3 ~ "Post-Meno",
+    TRUE ~ NA_character_
+  ), levels = c("Pre-Meno", "Post-Meno"))) %>%
+  filter(!is.na(s1_date), !is.na(s2_date),       # attended both sessions
+         !is.na(group_var),
+         s2_age >= 39.5 & s2_age < 65.5)          # aged 40-65 (rounded)
+
+start_ids <- bhamm_df %>% select(id, group_var) %>% arrange(group_var, id)
+cat("Starting N (before health exclusions):", nrow(start_ids), "\n")
+print(table(start_ids$group_var))
+```
+
+# 2. Health exclusions
+
+```{r health-exclusions}
+exclusion_criteria <- list(
+  HRT                       = function(df) filter(df, hrt_use == 2),
+  hysterectomy_oophorectomy = function(df) filter(df, straw_issues_notes ==
+                                                    "Hysterectomy, Unilateral oophorectomy"),
+  # Post-meno: any HBC use. Pre-meno: HBC for non-contraceptive purposes only.
+  HBC                       = function(df) filter(df,
+    (group_var == "Post-Meno" & current_hbc_med_use == -1) |
+    (group_var == "Pre-Meno"  & current_hbc_med_use == -1 &
+       current_hbc_med_use_contraception == 1)),
+  BMI_over_40               = function(df) filter(df, bmi > 40)
+)
+
+exclusion_log <- imap_dfr(exclusion_criteria, function(fn, name) {
+  fn(bhamm_df) %>% mutate(reason = name) %>% select(id, group_var, reason)
+}) %>%
+  group_by(id, group_var) %>%
+  summarise(reason = paste(unique(reason), collapse = " & "), .groups = "drop")
+
+print(exclusion_log)
+write_csv(exclusion_log, shared_output_path("qc", "exclusion_log.csv"))
+
+bhamm_df_clean <- bhamm_df %>% filter(!id %in% exclusion_log$id)
+cat("After health exclusions:", nrow(bhamm_df_clean), "\n")
+print(table(bhamm_df_clean$group_var))
+```
+
+# 3. rsfMRI quality control
+
+```{r rsfmri-qc}
+rsfc_qc <- read_excel(here::here("data", "raw", params$rsfmri_qc_file)) %>%
+  janitor::clean_names() %>%
+  filter(id %in% bhamm_df_clean$id) %>%
+  mutate(final_rating_pass_fail = fedmatch::clean_strings(final_rating_pass_fail),
+         rater_2                = fedmatch::clean_strings(rater_2))
+
+qc_failed <- rsfc_qc %>%
+  filter(final_rating_pass_fail == "fail" | (!is.na(rater_2) & rater_2 == "fail")) %>%
+  transmute(id = as.character(id), reason = "Failed visual QC / excessive motion")
+
+# Manual removals with documented reasons (params$rsfmri_manual_excl, from the
+# private participant-exclusions file). IDs no longer in the sample at this
+# point remove no one.
+qc_manual <- tibble(
+  id     = vapply(params$rsfmri_manual_excl, function(e) as.character(e$id), character(1)),
+  reason = vapply(params$rsfmri_manual_excl, function(e) as.character(e$reason), character(1))
+)
+
+rsfmri_excl <- bind_rows(qc_manual, qc_failed %>% filter(!id %in% qc_manual$id)) %>%
+  inner_join(bhamm_df_clean %>% transmute(id = as.character(id), group_var), by = "id")
+print(rsfmri_excl)
+write_csv(rsfmri_excl, shared_output_path("qc", "rsfmri_qc_exclusions.csv"))
+
+bhamm_df_clean2 <- bhamm_df_clean %>% filter(!as.character(id) %in% rsfmri_excl$id)
+cat("After rsfMRI QC:", nrow(bhamm_df_clean2), "\n")
+print(table(bhamm_df_clean2$group_var))
+```
+
+# 4. Select & recode variables
+
+```{r select-columns}
+demo_cols <- c(
+  "id", "s2_age", "group_var",
+  "meds_antidepressant_uk", "meds_ssr_is", "meds_sar_is", "meds_snr_is",
+  "meds_tc_as", "meds_bzd", "meds_nbzd",
+  "meds_statin", "meds_cholestrol_lowering",
+  "enrol_meds_ace_inhibitor", "enrol_meds_ar_bs", "enrol_meds_ccb",
+  "enrol_meds_diuretic", "enrol_meds_alpha_blockers",
+  "bdi", "current_hbc_med_use", "repro_cond_pcos", "apoe4_allele"
+)
+
+mem_task_cols <- c(params$cs_vars, params$cr_vars)
+
+blood_cols <- c(
+  "chol_raw_s1", "chol_raw_s2", "hdl_raw_s1", "hdl_raw_s2",
+  "ldl_raw_s1", "ldl_raw_s2", "apo_a1_raw_s1", "apo_a1_raw_s2",
+  "apo_b_raw_s1", "apo_b_raw_s2", "h_crp_raw_s1", "h_crp_raw_s2",
+  "non_hdl_chol_raw_s1", "non_hdl_chol_raw_s2", "trig_raw_s1", "trig_raw_s2",
+  "fsh_raw_s1", "fsh_raw_s2", "e2_raw_s1", "e2_raw_s2",
+  "lh_raw_s1", "lh_raw_s2", "prog_raw_s1", "prog_raw_s2",
+  "testo_raw_s1", "testo_raw_s2",
+  "bp_systolic_s1", "bp_systolic_s2", "bp_diastolic_s1", "bp_diastolic_s2",
+  "bmi", "edu", "ipaq_va_day", "ipaq_va_min"
+)
+
+extra_cols <- params$extra_cleaning_cols
+
+cleaned_df <- bhamm_df_clean2 %>%
+  select(any_of(c(demo_cols, mem_task_cols, blood_cols, extra_cols))) %>%
+  mutate(across(any_of(blood_cols), as.numeric),
+         across(any_of(extra_cols), ~ as.numeric(haven::zap_labels(.x))))
+
+missing_cols <- setdiff(c(demo_cols, mem_task_cols, blood_cols, extra_cols), names(cleaned_df))
+if (length(missing_cols)) stop("Columns not found in raw data: ", paste(missing_cols, collapse = ", "))
+```
+
+```{r recode-categorical}
+# SPSS coding for yes/no items: -1 = Yes, 1 = No
+yes_no <- function(x) factor(case_when(x == -1 ~ "Yes", x == 1 ~ "No"), levels = c("Yes", "No"))
+any_yes <- function(df, cols) {
+  factor(if_else(rowSums(across(all_of(cols), ~ . == -1), na.rm = TRUE) > 0, "Yes", "No"),
+         levels = c("Yes", "No"))
+}
+
+cleaned_df <- cleaned_df %>%
+  mutate(
+    current_hbc_med_use  = yes_no(current_hbc_med_use),
+    repro_cond_pcos      = yes_no(repro_cond_pcos),
+    any_psychotropic     = any_yes(., c("meds_antidepressant_uk", "meds_ssr_is", "meds_sar_is",
+                                        "meds_snr_is", "meds_tc_as", "meds_bzd", "meds_nbzd")),
+    any_chol_med         = any_yes(., c("meds_statin", "meds_cholestrol_lowering")),
+    any_antihypertensive = any_yes(., c("enrol_meds_ace_inhibitor", "enrol_meds_ar_bs",
+                                        "enrol_meds_ccb", "enrol_meds_diuretic",
+                                        "enrol_meds_alpha_blockers")),
+    apoe4_carrier        = factor(case_when(apoe4_allele == -1 ~ "Carrier",
+                                            apoe4_allele ==  1 ~ "Non-Carrier")),
+    bai                  = bai_somatic + bai_subjective   # BAI total = sum of subscales
+  )
+
+for (v in c("current_hbc_med_use", "repro_cond_pcos", "any_psychotropic",
+            "any_chol_med", "any_antihypertensive", "apoe4_carrier")) {
+  cat("\n", v, "\n"); print(table(cleaned_df[[v]], cleaned_df$group_var, useNA = "ifany"))
+}
+```
+
+# 5. Collate S1/S2 blood measures
+
+```{r combine-sessions}
+# Blood/BP: S1 primary, S2 fallback. Hormones: S2 primary (closer to scan), S1 fallback.
+vars_blood_collated <- cleaned_df %>%
+  transmute(
+    id, group_var,
+    e2_raw           = coalesce(e2_raw_s2,  e2_raw_s1),
+    fsh_raw          = coalesce(fsh_raw_s2, fsh_raw_s1),
+    chol_raw         = coalesce(chol_raw_s1,         chol_raw_s2),
+    hdl_raw          = coalesce(hdl_raw_s1,          hdl_raw_s2),
+    ldl_raw          = coalesce(ldl_raw_s1,          ldl_raw_s2),
+    apo_a1_raw       = coalesce(apo_a1_raw_s1,       apo_a1_raw_s2),
+    apo_b_raw        = coalesce(apo_b_raw_s1,        apo_b_raw_s2),
+    h_crp_raw        = coalesce(h_crp_raw_s1,        h_crp_raw_s2),
+    trig_raw         = coalesce(trig_raw_s1,         trig_raw_s2),
+    non_hdl_chol_raw = coalesce(non_hdl_chol_raw_s1, non_hdl_chol_raw_s2),
+    bp_systolic      = coalesce(bp_systolic_s1,      bp_systolic_s2),
+    bp_diastolic     = coalesce(bp_diastolic_s1,     bp_diastolic_s2),
+    bmi
+  )
+blood_vars_final <- setdiff(names(vars_blood_collated), c("id", "group_var"))
+
+# missForest inputs: all collated blood measures except the hormones and
+# diastolic BP. SBP and total cholesterol are the only PLS variables with
+# missing values; the other lipids and BMI act as auxiliary predictors.
+blood_vars_for_imputation <- setdiff(blood_vars_final, c("e2_raw", "fsh_raw", "bp_diastolic"))
+
+# Non-detects (-1) -> NA for the imputation variables
+vars_blood_collated <- vars_blood_collated %>%
+  mutate(across(all_of(blood_vars_for_imputation), ~ na_if(.x, -1)))
+
+cleaned_df2 <- cleaned_df %>%
+  select(-bmi) %>%
+  left_join(vars_blood_collated %>% select(id, all_of(blood_vars_final)), by = "id")
+stopifnot(!any(duplicated(cleaned_df2$id)))
+```
+
+# 6. Imputation (missForest)
+
+```{r impute-missforest}
+# Participant id and group are passed to missForest as predictors, as in the
+# submitted analysis. Changing the input set changes the imputed values and
+# would require re-running every B-PLS in MATLAB.
+impute_df <- cleaned_df2 %>%
+  select(id, group_var, all_of(blood_vars_for_imputation)) %>%
+  as.data.frame()
+
+impute_df %>%
+  group_by(group_var) %>%
+  summarise(N = n(), missing_TC = sum(is.na(chol_raw)), missing_SBP = sum(is.na(bp_systolic))) %>%
+  knitr::kable(caption = sprintf("Missing values before imputation (imputation sample, N = %d)",
+                                 nrow(impute_df)))
+
+set.seed(params$seed_imputation)
+missforest_out <- missForest(impute_df)
+cat("missForest OOB error:\n"); print(missforest_out$OOBerror)
+
+imputed <- missforest_out$ximp %>%
+  select(id, all_of(blood_vars_for_imputation)) %>%
+  rename_with(~ paste0(.x, "_imputed"), all_of(blood_vars_for_imputation))
+
+cleaned_df3 <- cleaned_df2 %>% left_join(imputed, by = "id")
+```
+
+# 7. Derived variables
+
+```{r derived-vars}
+cleaned_df3 <- cleaned_df3 %>%
+  mutate(
+    # Physical activity: -1 = Active (>= min_days vigorous days/wk of >= min_minutes),
+    # 1 = Inactive (including missing IPAQ)
+    Exercise_coded = case_when(
+      ipaq_va_day >= params$exercise$min_days &
+        ipaq_va_min >= params$exercise$min_minutes ~ -1L,
+      TRUE ~ 1L),
+    # Other hormones (PCOS MANOVA only): S2 primary, S1 fallback
+    lh_raw    = coalesce(lh_raw_s2,    lh_raw_s1),
+    prog_raw  = coalesce(prog_raw_s2,  prog_raw_s1),
+    testo_raw = coalesce(testo_raw_s2, testo_raw_s1)
+  )
+print(table(cleaned_df3$Exercise_coded, cleaned_df3$group_var, useNA = "ifany"))
+```
+
+# 8. Sample-level exclusions & final sample
+
+```{r final-sample}
+# Imputation above used the full sample; params$sample_excl are dropped here.
+sample_excl <- sample_exclusions()
+stopifnot("sample_excl ID not found in the data" = all(sample_excl$id %in% cleaned_df3$id))
+
+sample_excl_log <- sample_excl %>%
+  left_join(cleaned_df3 %>% select(id, group_var), by = "id")
+print(sample_excl_log)
+write_csv(sample_excl_log, shared_output_path("qc", "sample_exclusions.csv"))
+
+bhamm_final <- cleaned_df3 %>%
+  filter(!id %in% sample_excl$id) %>%
+  arrange(group_var, id)                 # canonical MATLAB row order
+
+cat("Final N:", nrow(bhamm_final), "\n")
+print(table(bhamm_final$group_var))
+
+bhamm_final %>%
+  group_by(group_var) %>%
+  summarise(N = n(), imputed_TC = sum(is.na(chol_raw)), imputed_SBP = sum(is.na(bp_systolic))) %>%
+  knitr::kable(caption = "Imputed values in the final sample (Methods 2.9.1)")
+```
+
+# 9. Figure S1 — observed vs imputed
+
+```{r figS1, fig.width = 10, fig.height = 5}
+figS1_df <- bhamm_final %>%
+  select(id, group_var, chol_raw, bp_systolic, chol_raw_imputed, bp_systolic_imputed) %>%
+  pivot_longer(c(chol_raw_imputed, bp_systolic_imputed),
+               names_to = "variable", values_to = "value") %>%
+  mutate(imputed = if_else(variable == "chol_raw_imputed", is.na(chol_raw), is.na(bp_systolic)),
+         variable = factor(variable, levels = c("bp_systolic_imputed", "chol_raw_imputed"),
+                           labels = c("Systolic Blood Pressure (mmHg)", "Total Cholesterol (mmol/L)")))
+
+p_figS1 <- ggplot(figS1_df, aes(x = value)) +
+  geom_density(data = filter(figS1_df, !imputed),
+               aes(linetype = "Observed"), linewidth = 0.9, colour = "grey30") +
+  geom_density(aes(linetype = "Observed + imputed"), linewidth = 0.9, colour = "#2a7fba") +
+  geom_rug(data = filter(figS1_df, imputed), aes(colour = group_var),
+           linewidth = 1, length = grid::unit(0.06, "npc")) +
+  facet_wrap(~ variable, scales = "free") +
+  scale_linetype_manual(values = c("Observed" = "solid", "Observed + imputed" = "dashed"),
+                        name = NULL) +
+  scale_colour_manual(values = GROUP_COLORS, name = "Imputed value") +
+  labs(x = NULL, y = "Density",
+       title = "Observed and missForest-imputed values",
+       subtitle = sprintf(paste0("N = %d. Imputed values (rug): total cholesterol = %d, ",
+                                 "systolic BP = %d. Imputation was run on N = %d before ",
+                                 "the sample-level exclusion."),
+                          nrow(bhamm_final), sum(is.na(bhamm_final$chol_raw)),
+                          sum(is.na(bhamm_final$bp_systolic)), nrow(impute_df))) +
+  theme_apa(base_size = 11) +
+  theme(legend.position = "bottom", plot.subtitle = element_text(size = 9))
+
+print(p_figS1)
+save_png(p_figS1, supp_path("FigureS1_imputation.png"), width = 10, height = 5)
+```
+
+# 10. Save
+
+```{r save}
+saveRDS(bhamm_final, cleaning_path("bhamm_clean.rds"))
+write.csv(bhamm_final, cleaning_path("bhamm_clean.csv"), row.names = FALSE)
+
+write_csv(start_ids, shared_output_path("qc", "script1_start_ids.csv"))
+write_csv(bhamm_final %>% select(id, group_var),
+          shared_output_path("qc", "script1_final_ids.csv"))
+
+# MATLAB inputs for every registered run (omnibus + reduced-block)
+export_all_runs()
+
+save_session_info("script01")
+```
+
+**Next step:** run B-PLS in PLSGUI (1000 permutations, 500 bootstraps) on each
+`data/matlab_io/input/<segment>/pls_export.csv`, saving the result as
+`data/matlab_io/output/<segment>/bpls_result.mat`.

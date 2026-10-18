@@ -1,0 +1,454 @@
+---
+title: "RP2 — Script 3: B-PLS Results"
+author: "Julia Kearley"
+date: "`r format(Sys.Date(), '%B %d, %Y')`"
+output:
+  html_document:
+    toc: true
+    toc_depth: 3
+    toc_float: true
+    theme: united
+    code_folding: show
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, message = FALSE, warning = FALSE,
+                      fig.width = 10, fig.height = 7, dpi = 300)
+source(here::here("scripts", "00_functions.R"))
+setup_run()
+```
+
+# Overview
+
+Reads one PLSGUI B-PLS result (the active run: the omnibus run, or one
+reduced-block run when knitted by run.R's registry sweep) and builds, for each
+reported LV:
+
+- **A** brain-score × behaviour correlations with PLSGUI bootstrap CIs (bar plot)
+- **B** brain score vs each behavioural variable (scatter)
+- **C** network density of the top 5% |BSR| edges (positive / negative; shown if any cell ≥ 5%)
+- **D** |r| between this LV's BSR map and each reduced-block run's sub-LV1 BSR map, with its permutation p (omnibus run only)
+
+**Omnibus run outputs** (numbers from `params$report_lvs`: LV2 = Figure/Table 2,
+LV1 = Figure S4 / Table S4)
+
+- `outputs/manuscript/Figure2_LV2.png` and panels `Figure2{A,B,C,D}_LV2_*.png`
+- `outputs/supplement/FigureS4_LV1.png` and panels `FigureS4{A,B,C,D}_LV1_*.png`
+- `outputs/manuscript/Table2_LV2_correlations.*`, `outputs/supplement/TableS4_LV1_correlations.*`
+- `outputs/supplement/TableS1_all_LVs.*` — all eight LVs
+- `data/processed/<segment>/pls_results.rds` — brain scores for 04
+
+**Every run:** `outputs/<segment>/lv{n}_correlations.csv`,
+`lv{n}_density_{positive,negative}.csv`, `lv{n}_composite.rds` (used by 06).
+
+```{r load-packages}
+pacman::p_load(here, tidyverse, R.matlab, patchwork, flextable, officer, knitr)
+```
+
+# 1. Load B-PLS result
+
+```{r load-matlab}
+is_primary <- identical(params$active_run_role, "primary")
+lvs        <- params$report_lv_names
+lv_idx     <- setNames(as.integer(sub("LV", "", lvs)), lvs)
+
+pls <- read_bpls(matlab_output_path("bpls_result.mat"))
+cat(sprintf("%s: %d participants, %d LVs, %d permutations, %d bootstraps\n",
+            params$active_run_label, nrow(pls$usc), length(pls$perm_p),
+            pls$n_perm, pls$n_boot))
+
+lv_summary <- tibble(LV = paste0("LV", seq_along(pls$perm_p)),
+                     perm_p = pls$perm_p,
+                     pct_cov = pct_covariance(pls$s))
+kable(lv_summary, digits = 4)
+```
+
+# 2. Check row/column order against the cleaned data
+
+```{r verify-order}
+# bhamm_clean.rds is in the same group-then-ID order as pls_export.csv. The
+# behavioural block stored in the .mat must equal it value-for-value, which
+# checks both participant (row) order and variable (column) order.
+pls_df <- readRDS(cleaning_path("bhamm_clean.rds"))
+stopifnot(nrow(pls$behavdata) == nrow(pls_df),
+          ncol(pls$behavdata) == length(params$pls_vars),
+          max(abs(pls$behavdata - as.matrix(pls_df[params$pls_vars]))) < 1e-6)
+cat("✓ stacked.behavdata matches bhamm_clean.rds (", nrow(pls_df), "rows )\n")
+```
+
+# 3. Sign flip and bootstrap CIs
+
+```{r sign-flip-ci}
+# Flip every output of an LV with lv_sign_flip = -1 (USC, VSC, correlations,
+# bootstrap distribution, BSRs).
+for (lv in lvs) {
+  k <- lv_idx[[lv]]; f <- params$lv_sign_flip[[lv]] %||% 1
+  pls$usc[, k]         <- pls$usc[, k] * f
+  pls$vsc[, k]         <- pls$vsc[, k] * f
+  pls$orig_corr[, k]   <- pls$orig_corr[, k] * f
+  pls$distrib[, k, ]   <- pls$distrib[, k, ] * f
+  pls$bsr[, k]         <- pls$bsr[, k] * f
+  if (f == -1) {                           # flipping swaps the PLSGUI bounds
+    ll <- pls$llcorr[, k]
+    pls$llcorr[, k] <- -pls$ulcorr[, k]
+    pls$ulcorr[, k] <- -ll
+  }
+}
+
+# Bootstrap samples only (slice 1 of distrib is the observed correlation)
+boot_samples <- pls$distrib[, , -1, drop = FALSE]
+stopifnot(max(abs(pls$distrib[, , 1] - pls$orig_corr)) < 1e-10)
+
+# CIs on r: PLSGUI's stored bounds (boot_result.llcorr / ulcorr), computed by
+# PLSGUI at the confidence level saved in the result (boot_result.clim).
+lower_ci <- pls$llcorr
+upper_ci <- pls$ulcorr
+ci_label <- params$ci_label
+cat(sprintf("CIs on r: PLSGUI llcorr/ulcorr, confidence level = %g, %d bootstrap samples\n",
+            pls$clim, pls$n_boot))
+```
+
+# 4. Brain-score × behaviour correlations
+
+```{r correlations}
+# Rows of orig_corr / distrib: behavioural variables within group,
+# Pre-Meno block first, then Post-Meno.
+groups    <- levels(pls_df$group_var)
+bv_labels <- unname(unlist(params$pls_var_labels)[params$pls_vars])
+n_bv      <- length(params$pls_vars)
+
+corr_grid <- expand.grid(Variable = factor(bv_labels, levels = bv_labels),
+                         Group    = factor(groups, levels = groups))
+stopifnot(nrow(corr_grid) == nrow(pls$orig_corr))
+
+corr_table <- map_dfr(lvs, function(lv) {
+  k <- lv_idx[[lv]]
+  corr_grid %>% mutate(LV = lv, r = pls$orig_corr[, k],
+                       lower = lower_ci[, k], upper = upper_ci[, k],
+                       sig = ifelse(lower > 0 | upper < 0, "*", ""))
+})
+
+# Pre − post difference in each correlation, 95% percentile bootstrap CI
+diff_table <- map_dfr(lvs, function(lv) {
+  k     <- lv_idx[[lv]]
+  pre   <- seq_len(n_bv); post <- n_bv + seq_len(n_bv)
+  d_obs <- pls$orig_corr[pre, k] - pls$orig_corr[post, k]
+  d_bt  <- boot_samples[pre, k, , drop = FALSE] - boot_samples[post, k, , drop = FALSE]
+  tibble(LV = lv, Variable = factor(bv_labels, levels = bv_labels), diff_r = d_obs,
+         diff_lower = apply(d_bt, 1, quantile, probs = 0.025, type = 5),
+         diff_upper = apply(d_bt, 1, quantile, probs = 0.975, type = 5),
+         diff_sig   = ifelse(diff_lower > 0 | diff_upper < 0, "*", ""))
+})
+
+kable(corr_table, digits = 3, caption = paste("Brain-score × behaviour r with", ci_label))
+kable(diff_table, digits = 3, caption = "Pre − post difference in r, 95% percentile bootstrap CI")
+
+for (lv in lvs) {
+  write_csv(left_join(corr_table %>% filter(LV == lv), diff_table, by = c("LV", "Variable")),
+            run_output_path(sprintf("%s_correlations.csv", tolower(lv))))
+}
+```
+
+# 5. Network density of reliable edges
+
+```{r density}
+rois          <- roi_atlas()
+network_order <- c("Vis", "LimbicHippocampal", "SalVentAttn", "DorsAttn",
+                   "Default", "Cont", "SomMot")
+stopifnot(setequal(network_order, unique(as.character(rois$Network))),
+          nrow(pls$bsr) == nrow(rois) * (nrow(rois) - 1) / 2)
+
+# Percentage of possible edges in each network pair whose BSR exceeds the
+# threshold (positive) or falls below -threshold (negative).
+compute_network_density <- function(bsr_vec, threshold) {
+  n <- nrow(rois)
+  m <- matrix(0, n, n); m[upper.tri(m)] <- bsr_vec; m <- m + t(m)
+  dens <- list(positive = matrix(0, 7, 7, dimnames = list(network_order, network_order)),
+               negative = matrix(0, 7, 7, dimnames = list(network_order, network_order)))
+  for (a in seq_along(network_order)) for (b in seq_len(a)) {
+    ia <- which(rois$Network == network_order[a]); ib <- which(rois$Network == network_order[b])
+    sub   <- m[ia, ib, drop = FALSE]
+    edges <- if (a == b) sub[lower.tri(sub)] else as.vector(sub)
+    dens$positive[a, b] <- dens$positive[b, a] <- 100 * mean(edges >  threshold)
+    dens$negative[a, b] <- dens$negative[b, a] <- 100 * mean(edges < -threshold)
+  }
+  dens
+}
+
+density_results <- map(setNames(lvs, lvs), function(lv) {
+  bsr_vec   <- pls$bsr[, lv_idx[[lv]]]
+  threshold <- quantile(abs(bsr_vec), 0.95, na.rm = TRUE)     # top 5% |BSR|
+  cat(sprintf("%s: top-5%% |BSR| threshold = %.3f\n", lv, threshold))
+  compute_network_density(bsr_vec, threshold)
+})
+
+for (lv in lvs) for (sgn in c("positive", "negative")) {
+  write.csv(density_results[[lv]][[sgn]],
+            run_output_path(sprintf("%s_density_%s.csv", tolower(lv), sgn)))
+}
+```
+
+# 6. Figure panels
+
+```{r panel-functions}
+# Panel titles say "Sub-LV1" etc. for reduced-block runs
+lv_title <- function(lv) if (is_primary) lv else paste0("Sub-", lv)
+
+make_correlation_bar <- function(lv) {
+  df <- corr_table %>% filter(LV == lv) %>%
+    mutate(sig_y = ifelse(r > 0, upper + 0.06, lower - 0.14))
+  ggplot(df, aes(x = Variable, y = r, fill = Group)) +
+    geom_col(width = 0.65, alpha = 0.85, color = "black") +
+    geom_errorbar(aes(ymin = lower, ymax = upper), width = 0.25, linewidth = 0.8) +
+    geom_hline(yintercept = 0, linetype = "dashed", color = "gray50", linewidth = 0.8) +
+    geom_text(aes(y = sig_y, label = sig), color = "red3", size = 7) +
+    scale_fill_manual(values = GROUP_COLORS) +
+    scale_y_continuous(limits = c(-1.25, 1.25), breaks = seq(-1, 1, 0.5)) +
+    facet_wrap(~ Group, ncol = 1) +
+    labs(title = sprintf("%s: Brain–Behavior Correlations with %ss", lv_title(lv), tools::toTitleCase(ci_label)),
+         x = "Risk Factor", y = "Brain Score–Behavior Correlation (r)") +
+    theme_apa(base_size = 13) +
+    theme(axis.text.x = element_text(angle = 30, hjust = 1, size = 12),
+          legend.position = "none")
+}
+
+# Omnibus run: all four behavioural variables. Reduced-block run: its own variable.
+bv_axis_labels <- c(chol_raw_imputed = "Total Cholesterol (mmol/L)",
+                    bp_systolic_imputed = "Systolic BP (mmHg)",
+                    s2_age = "Age (years)", edu = "Education (years)")
+
+make_brain_bv_scatter <- function(lv) {
+  k  <- lv_idx[[lv]]
+  df <- pls_df %>%
+    mutate(brain_score = pls$usc[, k]) %>%
+    select(group_var, brain_score, all_of(params$pls_vars)) %>%
+    pivot_longer(all_of(params$pls_vars), names_to = "bv", values_to = "value") %>%
+    mutate(BV = factor(bv_axis_labels[bv], levels = bv_axis_labels[params$pls_vars]))
+  ggplot(df, aes(x = value, y = brain_score, color = group_var, fill = group_var)) +
+    geom_point(alpha = 0.6, size = 2.5) +
+    geom_smooth(method = "lm", se = TRUE, alpha = 0.15, linewidth = 1) +
+    scale_color_manual(values = GROUP_COLORS, name = "Group") +
+    scale_fill_manual(values = GROUP_COLORS, name = "Group") +
+    facet_wrap(~ BV, scales = "free_x", ncol = 2) +
+    labs(x = NULL, y = sprintf("%s brain score (USC)", lv_title(lv)),
+         title = sprintf("%s brain score by behavioural variable", lv_title(lv))) +
+    theme_apa(base_size = 12) +
+    theme(legend.position = "bottom")
+}
+
+make_density_plot <- function(dens_mat, title, palette) {
+  nets <- rownames(dens_mat)
+  df <- expand.grid(Network_1 = factor(nets, levels = rev(nets)),
+                    Network_2 = factor(nets, levels = nets)) %>%
+    mutate(Density = dens_mat[cbind(match(Network_1, nets), match(Network_2, nets))])
+  ggplot(df, aes(x = Network_2, y = Network_1, fill = Density)) +
+    geom_tile(color = "white", linewidth = 0.5) +
+    geom_text(aes(label = ifelse(Density > 0, sprintf("%.1f", Density), "")), size = 3) +
+    scale_fill_distiller(palette = palette, direction = 1,
+                         limits = c(0, max(dens_mat, 1e-9)), name = "Density (%)") +
+    labs(title = title, x = NULL, y = NULL) +
+    coord_fixed() +
+    theme_minimal(base_size = 11) +
+    theme(axis.text.x = element_text(angle = 45, hjust = 1, size = 9),
+          axis.text.y = element_text(size = 9),
+          plot.title = element_text(face = "bold", size = 11, hjust = 0.5),
+          panel.grid = element_blank())
+}
+
+# Panel C: density matrices with any cell >= 5% (stacked if both qualify)
+make_density_panel <- function(lv) {
+  d <- density_results[[lv]]
+  plots <- list(
+    if (max(d$positive) >= 5) make_density_plot(d$positive, paste(lv_title(lv), "positive salience density"), "Reds"),
+    if (max(d$negative) >= 5) make_density_plot(d$negative, paste(lv_title(lv), "negative salience density"), "Blues"))
+  plots <- Filter(Negate(is.null), plots)
+  if (length(plots) == 0) return(NULL)
+  if (length(plots) == 1) plots[[1]] else wrap_elements(wrap_plots(plots, ncol = 1))
+}
+
+# Panel D: |r| and permutation p for each reduced-block sub-LV1, drawn as a
+# ggplot table so it scales with the composite and can be saved on its own.
+# cells: Predictor, r1, p1 (formatted text). Sub-LV2s are not shown; their
+# smallest permutation p is given in the key (sub_lv2_min_p).
+make_recovery_panel <- function(cells, lv, sub_lv2_min_p) {
+  n  <- nrow(cells)
+  xs <- c(Predictor = 1, r1 = 2.7, p1 = 3.6)
+  body <- cells %>% mutate(y = rev(seq_len(n))) %>%
+    pivot_longer(-y, names_to = "column", values_to = "label") %>%
+    mutate(x = xs[column], hjust = ifelse(column == "Predictor", 0, 0.5))
+  groups <- tibble(x = mean(xs[c("r1", "p1")]), y = n + 1.95, label = "Sub-LV1")
+  # plotmath labels, so |r| draws with real bars (plain "|" looks like "l")
+  r_head <- "group('|', bolditalic(r), '|')"
+  heads  <- tibble(x = xs, y = n + 1, label = c("bold(Predictor)", r_head, "bolditalic(p)"),
+                   hjust = c(0, 0.5, 0.5))
+  key <- c(sprintf("group('|', italic(r), '|')*': absolute correlation between the %s and sub-LV1 bootstrap-ratio maps'", lv),
+           "'      (all 20,706 edges);'~~italic(p)*': permutation p of the sub-LV1.'",
+           sprintf("'Sub-LV1: first LV of each single-variable reduced-block B-PLS. Sub-LV2s (all '*italic(p)*' > %s) not shown.'",
+                   sub("^0", "", sprintf("%.1f", floor(sub_lv2_min_p * 10) / 10))))
+  ggplot() +
+    geom_text(data = body, aes(x, y, label = label, hjust = hjust), size = 4.6) +
+    geom_text(data = groups, aes(x, y, label = label), size = 4.8, fontface = "bold") +
+    geom_text(data = heads, aes(x, y, label = label, hjust = hjust), size = 4.8, parse = TRUE) +
+    annotate("text", x = 0.88, y = c(-0.25, -0.85, -1.45), label = key, parse = TRUE, hjust = 0,
+             size = 3.5, colour = "grey30") +
+    annotate("segment", x = c(0.85, xs[["r1"]] - 0.45, 0.85, 0.85),
+             xend = c(4.15, xs[["p1"]] + 0.4, 4.15, 4.15),
+             y = c(n + 2.55, n + 1.5, n + 0.5, 0.45),
+             yend = c(n + 2.55, n + 1.5, n + 0.5, 0.45),
+             linewidth = c(0.9, 0.4, 0.5, 0.9)) +
+    scale_x_continuous(limits = c(0.85, 6.2), expand = c(0, 0)) +
+    scale_y_continuous(limits = c(-1.8, n + 2.75), expand = c(0, 0)) +
+    labs(title = sprintf("%s – Correlation with Reduced-Block B-PLS LVs", lv)) +
+    theme_void(base_size = 13) +
+    theme(plot.title = element_text(face = "bold", size = 14, hjust = 0, margin = margin(b = 4)),
+          plot.margin = margin(10, 10, 10, 10))
+}
+```
+
+```{r panel-d}
+# Panel D (omnibus run only): |r| between this LV's BSR map and each
+# reduced-block LV's BSR map, with that sub-LV's permutation p in parentheses.
+recovery_panel <- setNames(vector("list", length(lvs)), lvs)
+
+if (is_primary) {
+  sub_runs <- pls_runs_by_role("sensitivity")
+  sub_pls  <- map(setNames(sub_runs, sub_runs), function(rid) {
+    read_bpls(here::here("data", "matlab_io", "output",
+                         params$pls_runs[[rid]]$segment, "bpls_result.mat"))
+  })
+  fmt_p <- function(p) ifelse(p < .001, "< .001", sub("^0", "", sprintf("%.3f", p)))
+  fmt_r <- function(r) sub("^0", "", sprintf("%.2f", r))
+
+  for (lv in lvs) {
+    rows <- map_dfr(sub_runs, function(rid) {
+      sp <- sub_pls[[rid]]
+      stopifnot(length(sp$perm_p) == 2)              # single-variable run, two groups
+      tibble(Predictor = params$pls_var_labels[[params$pls_runs[[rid]]$pls_vars[[1]]]],
+             r1 = fmt_r(abs(cor(pls$bsr[, lv_idx[[lv]]], sp$bsr[, 1]))), p1 = fmt_p(sp$perm_p[1]))
+    })
+    sub_lv2_min_p <- min(map_dbl(sub_pls, ~ .x$perm_p[2]))
+    recovery_panel[[lv]] <- make_recovery_panel(rows, lv, sub_lv2_min_p)
+  }
+}
+```
+
+# 7. Composite figures
+
+Omnibus run: 2 × 2 layout (A correlations, B scatter / C density, D
+reduced-block table), tagged with the figure number ("2A" … "2D", "S4A" …).
+Every panel is also saved on its own. Reduced-block runs: one row (A–C),
+stacked by 06.
+
+```{r composites, fig.width = 18, fig.height = 12}
+tag_theme <- theme(plot.tag = element_text(size = 26, face = "bold", family = "serif"))
+no_density <- ggplot() +
+  annotate("text", x = 0, y = 0, label = "No network pair reached 5% density", size = 5) +
+  theme_void()
+
+for (lv in lvs) {
+  pA <- make_correlation_bar(lv)
+  pB <- make_brain_bv_scatter(lv)
+  pC <- make_density_panel(lv)
+  pD <- recovery_panel[[lv]]
+
+  if (is_primary) {
+    fig <- params$report_lvs[[lv]]$figure
+    p_comp <- ((pA | pB) + plot_layout(widths = c(1, 1.3))) /
+              ((wrap_elements(full = pC %||% no_density) | pD) + plot_layout(widths = c(1, 1.3))) +
+      plot_annotation(tag_levels = list(paste0(fig, LETTERS[1:4]))) & tag_theme
+  } else {
+    p_comp <- wrap_plots(Filter(Negate(is.null), list(pA, pB, pC)), nrow = 1,
+                         widths = c(1, 1.2, 1)[seq_len(2 + !is.null(pC))]) +
+      plot_annotation(tag_levels = "A")
+  }
+  print(p_comp)
+  saveRDS(p_comp, run_output_path(sprintf("%s_composite.rds", tolower(lv))))
+
+  if (is_primary) {
+    save_png(p_comp, numbered_path("Figure", fig, sprintf("%s.png", lv)), width = 18, height = 12)
+    panel_files <- list(
+      list(pA, "A", "correlations", 7, 8), list(pB, "B", "scatter", 9, 8),
+      list(pC %||% no_density, "C", "network_density", 7, 6.5),
+      list(pD, "D", "reduced_block", 7.5, 4.5))
+    for (pf in panel_files) {
+      save_png(pf[[1]], numbered_path("Figure", paste0(fig, pf[[2]]), sprintf("%s_%s.png", lv, pf[[3]])),
+               width = pf[[4]], height = pf[[5]])
+    }
+  }
+}
+```
+
+# 8. Table 2 (LV2), Table S4 (LV1) and Table S1 (omnibus run)
+
+```{r tables, eval = is_primary}
+for (lv in lvs) {
+  k   <- lv_idx[[lv]]
+  num <- params$report_lvs[[lv]]$table
+  fig <- params$report_lvs[[lv]]$figure
+  tab <- corr_table %>% filter(LV == lv) %>%
+    transmute(Group, `Behavioural variable` = Variable, r = sprintf("%.3f", r),
+              CI = sprintf("[%.3f, %.3f]", lower, upper), sig)
+  d <- diff_table %>% filter(LV == lv)
+  status <- if (pls$perm_p[k] < params$alpha) "" else " (not significant, reported descriptively)"
+
+  ft <- flextable(tab) %>%
+    set_header_labels(CI = ci_label, sig = "") %>%
+    merge_v(j = "Group") %>%
+    align(j = c("r", "CI", "sig"), align = "center", part = "all") %>%
+    bold(part = "header") %>% autofit() %>%
+    set_caption(sprintf("Table %s. %s brain-behaviour correlations with %ss%s.",
+                        num, lv, ci_label, status)) %>%
+    add_footer_lines(c(
+      sprintf("Permutation p (%s) %s; %.2f%% of cross-block covariance. Asterisk = %s excludes zero.",
+              lv, format_pval(pls$perm_p[k]), pct_covariance(pls$s)[k], ci_label),
+      paste0("Between-group difference in r (premenopausal − postmenopausal), 95% percentile ",
+             "bootstrap CI: ",
+             paste(sprintf("%s %.2f [%.2f, %.2f]", d$Variable, d$diff_r, d$diff_lower, d$diff_upper),
+                   collapse = "; "), "."),
+      sprintf(paste0("Correlations and CIs from PLSGUI (confidence level = %g; %d bootstrap ",
+                     "samples). Signs follow the display convention of Figure %s, in which ",
+                     "positive-weight edges carry the reliable connectivity."),
+              pls$clim, pls$n_boot, fig))) %>%
+    italic(part = "footer") %>% fontsize(size = 9, part = "footer")
+
+  save_as_docx(ft, path = numbered_path("Table", num, sprintf("%s_correlations.docx", lv)))
+  write_csv(left_join(corr_table %>% filter(LV == lv), d, by = c("LV", "Variable")),
+            numbered_path("Table", num, sprintf("%s_correlations.csv", lv)))
+}
+
+# Supplementary Table S1: every LV of the omnibus B-PLS
+tabS1 <- lv_summary %>%
+  mutate(stable_edges = colSums(abs(pls$bsr) > 1.96),
+         pct_stable   = 100 * stable_edges / nrow(pls$bsr))
+write_csv(tabS1, supp_path("TableS1_all_LVs.csv"))
+
+ft_S1 <- tabS1 %>%
+  transmute(LV, `Permutation p` = format_pval(perm_p),
+            `% cross-block covariance` = sprintf("%.2f", pct_cov),
+            `Stable edges (|BSR| > 1.96)` = sprintf("%d (%.2f%%)", stable_edges, pct_stable)) %>%
+  flextable() %>% bold(part = "header") %>% autofit() %>%
+  set_caption("Table S1. All latent variables from the primary B-PLS.") %>%
+  add_footer_lines(c(
+    sprintf(paste0("%d permutations; %d bootstrap samples. Stable edges counted ",
+                   "out of %d edges."), pls$n_perm, pls$n_boot, nrow(pls$bsr)),
+    paste0("The Procrustes rotation applied during permutation weakens the null distribution for ",
+           "earlier LVs and shifts covariance toward later ones, so permutation p-values should be ",
+           "compared across LVs with caution (Danyluik et al., 2025)."))) %>%
+  italic(part = "footer") %>% fontsize(size = 9, part = "footer")
+save_as_docx(ft_S1, path = supp_path("TableS1_all_LVs.docx"))
+kable(tabS1, digits = 4)
+```
+
+# 9. Checkpoint (omnibus run, used by 04)
+
+```{r checkpoint, eval = is_primary}
+usc <- as.data.frame(pls$usc[, lv_idx, drop = FALSE])
+colnames(usc) <- paste0("usc_", lvs)
+saveRDS(list(pls_df = bind_cols(pls_df, usc), corr_table = corr_table,
+             diff_table = diff_table, lv_summary = lv_summary, ci_label = ci_label),
+        cleaning_path(params$run_label, "pls_results.rds"))
+```
+
+```{r session-info}
+save_session_info(paste0("script03_", params$run_label))
+```

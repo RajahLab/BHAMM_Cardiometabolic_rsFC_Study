@@ -1,0 +1,95 @@
+---
+title: "RP2 — Script 6: Reduced-Block B-PLS vs Primary B-PLS"
+author: "Julia Kearley"
+date: "`r format(Sys.Date(), '%B %d, %Y')`"
+output:
+  html_document:
+    toc: true
+    toc_depth: 3
+    toc_float: true
+    theme: united
+    code_folding: show
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, message = FALSE, warning = FALSE)
+source(here::here("scripts", "00_functions.R"))
+setup_run()
+```
+
+# Overview
+
+Methods 2.9.3 (reduced-block sub-B-PLS). For every reduced-block run and each
+of its LVs: permutation p, % cross-block covariance, and the absolute Pearson
+correlation between its BSR map and each primary LV's BSR map across all
+20,706 edges. These are the numbers in Results 3.3.2 and in Figures 2D / S4D.
+
+**Outputs**
+
+- `outputs/cross_comparison/reduced_block_summary.csv`
+- `outputs/supplement/FigureS2{A,B,C,D}_<run>_reduced_block.png` — Figures S2A–D, one per
+  reduced-block run (A SBP, B Age, C TC, D Education; numbers from `params$pls_runs`), sub-LV1
+  only (composites built by 03)
+- `outputs/<segment>/reduced_block_<run>_subLV1_subLV2.png` — the full figure for each run,
+  sub-LV1 above sub-LV2 (working output)
+
+```{r load-packages}
+pacman::p_load(here, tidyverse, R.matlab, patchwork, knitr)
+```
+
+```{r summary}
+primary_id <- pls_runs_by_role("primary")
+sub_runs   <- pls_runs_by_role("sensitivity")
+mat_path   <- function(rid) here::here("data", "matlab_io", "output",
+                                       params$pls_runs[[rid]]$segment, "bpls_result.mat")
+
+primary <- read_bpls(mat_path(primary_id))
+lvs     <- params$report_lv_names
+
+summary_df <- map_dfr(sub_runs, function(rid) {
+  sp <- read_bpls(mat_path(rid))
+  map_dfr(seq_along(sp$perm_p), function(i) {
+    tibble(run = rid, label = params$pls_runs[[rid]]$label, sub_lv = paste0("LV", i),
+           perm_p = sp$perm_p[i], pct_cov = pct_covariance(sp$s)[i],
+           !!!setNames(map(lvs, ~ abs(cor(primary$bsr[, as.integer(sub("LV", "", .x))], sp$bsr[, i]))),
+                       paste0("abs_r_primary_", lvs)))
+  })
+})
+
+kable(summary_df, digits = 3)
+write_csv(summary_df, shared_output_path("cross_comparison", "reduced_block_summary.csv"))
+```
+
+# Figures S2A–D (reduced-block runs)
+
+```{r reduced-block-figures, fig.width = 20, fig.height = 24}
+run_path <- function(seg, f) shared_output_path(seg, f)
+for (rid in sub_runs) {
+  seg <- params$pls_runs[[rid]]$segment
+  rows <- map(c("LV1", "LV2"), function(lv) {
+    s <- summary_df %>% filter(run == rid, sub_lv == lv)
+    # wrap_elements keeps each composite's own title and A-C panel tags
+    wrap_elements(full = readRDS(here::here("outputs", seg, sprintf("%s_composite.rds", tolower(lv)))) +
+      plot_annotation(title = sprintf(
+        "%s, Sub-%s: permutation p %s;  absolute correlation of its BSR map with primary LV1 = %s, LV2 = %s",
+        params$pls_runs[[rid]]$label, lv, format_pval(s$perm_p),
+        sub("^0", "", sprintf("%.2f", s$abs_r_primary_LV1)),
+        sub("^0", "", sprintf("%.2f", s$abs_r_primary_LV2))),
+        tag_levels = "A",
+        theme = theme(plot.title = element_text(face = "bold", size = 16, hjust = 0.5))))
+  })
+  short <- params$pls_runs[[rid]]$short
+  # Full figure (sub-LV1 and sub-LV2) in the run's own folder
+  save_png(wrap_plots(rows, ncol = 1),
+           run_path(seg, sprintf("reduced_block_%s_subLV1_subLV2.png", short)),
+           width = 20, height = 24, dpi = 150)
+  # Supplement: sub-LV1 only
+  save_png(rows[[1]], numbered_path("Figure", params$pls_runs[[rid]]$figure,
+                                    sprintf("%s_reduced_block.png", short)),
+           width = 20, height = 12, dpi = 150)
+}
+```
+
+```{r session-info}
+save_session_info("script06")
+```
